@@ -128,7 +128,17 @@ app.post("/auth/register", async (req, res) => {
 
     req.session.user = user;
 
-    return res.status(201).json({ user });
+req.session.save((err) => {
+  if (err) {
+    console.error("Session save error:", err);
+
+    return res.status(500).json({
+      error: "Failed to save registration session",
+    });
+  }
+
+  return res.status(201).json({ user });
+});
   } catch (err) {
     console.error("Registration error:", err);
 
@@ -299,6 +309,7 @@ app.get("/events", async (req, res) => {
 // CREATE EVENT
 // ========================================
 
+
 app.post("/events", requireAuth, async (req, res) => {
   try {
     const {
@@ -306,30 +317,51 @@ app.post("/events", requireAuth, async (req, res) => {
       description,
       location,
       dateTime,
+      endDateTime,
       category,
       imageUrl,
     } = req.body;
 
     if (
-      !title ||
-      !description ||
-      !location ||
+      !title?.trim() ||
+      !description?.trim() ||
+      !location?.trim() ||
       !dateTime ||
-      !category
+      !endDateTime ||
+      !category?.trim()
     ) {
       return res.status(400).json({
         error: "Please provide all required event information",
       });
     }
 
+    const start = new Date(dateTime);
+    const end = new Date(endDateTime);
+
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime())
+    ) {
+      return res.status(400).json({
+        error: "Invalid event date or time",
+      });
+    }
+
+    if (end <= start) {
+      return res.status(400).json({
+        error: "Event end time must be after start time",
+      });
+    }
+
     const events = await getEventsCollection();
 
     const newEvent = {
-      title,
-      description,
-      location,
+      title: title.trim(),
+      description: description.trim(),
+      location: location.trim(),
       dateTime,
-      category,
+      endDateTime,
+      category: category.trim(),
       imageUrl: imageUrl || "",
       organizerId: req.session.user.id,
       attendeeIds: [],
@@ -547,6 +579,7 @@ app.delete("/events/:id", requireAuth, async (req, res) => {
 // UPDATE EVENT (ONLY ORGANIZER)
 // ========================================
 
+
 app.patch("/events/:id", requireAuth, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -555,11 +588,25 @@ app.patch("/events/:id", requireAuth, async (req, res) => {
       });
     }
 
+    const events = await getEventsCollection();
+
+    const existingEvent = await events.findOne({
+      _id: new ObjectId(req.params.id),
+      organizerId: req.session.user.id,
+    });
+
+    if (!existingEvent) {
+      return res.status(404).json({
+        error: "Event not found or you are not its organizer",
+      });
+    }
+
     const allowedFields = [
       "title",
       "description",
       "location",
       "dateTime",
+      "endDateTime",
       "category",
       "imageUrl",
     ];
@@ -578,7 +625,32 @@ app.patch("/events/:id", requireAuth, async (req, res) => {
       });
     }
 
-    const events = await getEventsCollection();
+    const startDateTime = updates.dateTime ?? existingEvent.dateTime;
+    const endDateTime = updates.endDateTime ?? existingEvent.endDateTime;
+
+    if (!startDateTime || !endDateTime) {
+      return res.status(400).json({
+        error: "Both event start and end times are required",
+      });
+    }
+
+    const start = new Date(startDateTime);
+    const end = new Date(endDateTime);
+
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime())
+    ) {
+      return res.status(400).json({
+        error: "Invalid event date or time",
+      });
+    }
+
+    if (end <= start) {
+      return res.status(400).json({
+        error: "Event end time must be after start time",
+      });
+    }
 
     const result = await events.findOneAndUpdate(
       {
@@ -606,6 +678,7 @@ app.patch("/events/:id", requireAuth, async (req, res) => {
       event: {
         ...rest,
         id: _id.toString(),
+        attendeeIds: rest.attendeeIds ?? [],
       },
     });
   } catch (err) {
