@@ -1,13 +1,19 @@
 
+
 import express from "express";
 import cors from "cors";
 import session from "express-session";
 import bcrypt from "bcryptjs";
 import { MongoClient, ObjectId } from "mongodb";
+import { OAuth2Client } from "google-auth-library";
 import "dotenv/config";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 5001;
+
+const googleClient = new OAuth2Client(
+  process.env.GOOGLE_CLIENT_ID
+);
 
 // ========================================
 // Middleware
@@ -212,6 +218,120 @@ app.get("/auth/me", (req, res) => {
     authenticated: !!req.session.user,
     user: req.session.user || null,
   });
+});
+
+
+// ========================================
+// GOOGLE AUTHENTICATION
+// ========================================
+
+app.post("/auth/google", async (req, res) => {
+  try {
+    const { credential } = req.body;
+
+    if (!credential) {
+      return res.status(400).json({
+        error: "Google credential is required",
+      });
+    }
+
+    // Verify Google ID token
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+
+    if (!payload || !payload.email || !payload.email_verified) {
+      return res.status(401).json({
+        error: "Invalid or unverified Google account",
+      });
+    }
+
+    const googleId = payload.sub;
+    const email = payload.email.toLowerCase();
+    const name = payload.name || "";
+
+    const users = await getUsersCollection();
+
+    // Find an existing Google account
+    let user = await users.findOne({
+      googleId,
+    });
+
+    if (!user) {
+      // Check whether this email already belongs to another account
+      const existingUser = await users.findOne({
+        email,
+      });
+
+      if (existingUser) {
+        return res.status(409).json({
+          error:
+            "An account with this email already exists. Please login using your password first.",
+        });
+      }
+
+      // Create a new Google user
+      const result = await users.insertOne({
+        email,
+        name,
+        googleId,
+        authProvider: "google",
+        emailVerified: true,
+        createdAt: new Date(),
+      });
+
+      user = {
+        _id: result.insertedId,
+        email,
+        name,
+        googleId,
+      };
+    }
+
+    // Prepare user profile
+    const profile = {
+      id: user._id.toString(),
+      email: user.email,
+      name: user.name || "",
+    };
+
+    // Create a fresh session
+    req.session.regenerate((err) => {
+      if (err) {
+        console.error("Session regeneration error:", err);
+
+        return res.status(500).json({
+          error: "Failed to create login session",
+        });
+      }
+
+      req.session.user = profile;
+
+      req.session.save((saveError) => {
+        if (saveError) {
+          console.error("Google session save error:", saveError);
+
+          return res.status(500).json({
+            error: "Failed to save login session",
+          });
+        }
+
+        return res.json({
+          message: "Google login successful",
+          user: profile,
+        });
+      });
+    });
+  } catch (err) {
+    console.error("Google authentication error:", err);
+
+    return res.status(401).json({
+      error: "Google authentication failed",
+    });
+  }
 });
 
     
