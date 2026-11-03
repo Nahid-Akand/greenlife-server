@@ -1,27 +1,46 @@
 
-
 import express from "express";
 import cors from "cors";
 import session from "express-session";
+import MongoStore from "connect-mongo";
 import bcrypt from "bcryptjs";
 import { MongoClient, ObjectId } from "mongodb";
 import { OAuth2Client } from "google-auth-library";
 import "dotenv/config";
 
 const app = express();
-const PORT = Number(process.env.PORT) || 5001;
-
-const googleClient = new OAuth2Client(
-  process.env.GOOGLE_CLIENT_ID
-);
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // ========================================
-// Middleware
+// ENVIRONMENT CONFIGURATION
+// ========================================
+
+const isProduction = process.env.NODE_ENV === "production";
+
+const allowedOrigins = [
+  "http://localhost:3000",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
+// Vercel runs behind a proxy.
+if (isProduction) {
+  app.set("trust proxy", 1);
+}
+
+// ========================================
+// MIDDLEWARE
 // ========================================
 
 app.use(
   cors({
-    origin: "http://localhost:3000",
+    origin(origin, callback) {
+      // Allow requests without an Origin header (e.g. health checks).
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Origin not allowed by CORS"));
+    },
     credentials: true,
   })
 );
@@ -30,37 +49,55 @@ app.use(express.json());
 
 app.use(
   session({
-    secret: process.env.SESSION_SECRET || "dev-secret-change-me",
+    name: "greenlife.sid",
+    secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
+
+    store: MongoStore.create({
+      mongoUrl: process.env.MONGODB_URI,
+      dbName: process.env.MONGODB_DB || "greenlife",
+      collectionName: "sessions",
+      touchAfter: 24 * 60 * 60,
+    }),
+
     cookie: {
       httpOnly: true,
-      secure: false,
-      sameSite: "lax",
+      secure: isProduction,
+      sameSite: isProduction ? "none" : "lax",
       maxAge: 1000 * 60 * 60 * 24,
     },
   })
 );
 
 // ========================================
-// MongoDB Connection
+// MONGODB CONNECTION
 // ========================================
 
 let client;
 
-export async function connectToMongoDB() {
-  if (client) return client;
+async function connectToMongoDB() {
+  if (client) {
+    return client;
+  }
 
-  client = new MongoClient(process.env.MONGODB_URI);
+  if (!process.env.MONGODB_URI) {
+    throw new Error("MONGODB_URI is not configured");
+  }
+
+  const newClient = new MongoClient(process.env.MONGODB_URI);
 
   try {
-    await client.connect();
+    await newClient.connect();
+    client = newClient;
+
     console.log("Successfully connected to MongoDB!");
+
     return client;
-  } catch (err) {
-    client = null;
-    console.error("MongoDB connection failed:", err);
-    throw err;
+  } catch (error) {
+    await newClient.close().catch(() => {});
+    console.error("MongoDB connection failed:", error);
+    throw error;
   }
 }
 
@@ -79,7 +116,7 @@ async function getEventsCollection() {
 }
 
 // ========================================
-// Authentication Middleware
+// AUTHENTICATION MIDDLEWARE
 // ========================================
 
 function requireAuth(req, res, next) {
@@ -96,81 +133,99 @@ function requireAuth(req, res, next) {
 // AUTH ROUTES
 // ========================================
 
-// Register
+// REGISTER
 app.post("/auth/register", async (req, res) => {
   try {
     const { email, password, name } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({
-        error: "email and password required",
+        error: "Email and password are required",
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        error: "Password must be at least 8 characters",
       });
     }
 
     const users = await getUsersCollection();
 
-    const existing = await users.findOne({ email });
+    const existing = await users.findOne({
+      email: normalizedEmail,
+    });
 
     if (existing) {
       return res.status(409).json({
-        error: "email already registered",
+        error: "Email already registered",
       });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
 
     const result = await users.insertOne({
-      email,
+      email: normalizedEmail,
       passwordHash,
-      name: name || "",
+      name: name?.trim() || "",
+      authProvider: "local",
       createdAt: new Date(),
     });
 
-    const user = {
+    const profile = {
       id: result.insertedId.toString(),
-      email,
-      name: name || "",
+      email: normalizedEmail,
+      name: name?.trim() || "",
     };
 
-    req.session.user = user;
+    req.session.user = profile;
 
-req.session.save((err) => {
-  if (err) {
-    console.error("Session save error:", err);
+    req.session.save((error) => {
+      if (error) {
+        console.error("Registration session error:", error);
+
+        return res.status(500).json({
+          error: "Failed to save registration session",
+        });
+      }
+
+      return res.status(201).json({
+        user: profile,
+      });
+    });
+  } catch (error) {
+    console.error("Registration error:", error);
 
     return res.status(500).json({
-      error: "Failed to save registration session",
-    });
-  }
-
-  return res.status(201).json({ user });
-});
-  } catch (err) {
-    console.error("Registration error:", err);
-
-    return res.status(500).json({
-      error: "registration failed",
+      error: "Registration failed",
     });
   }
 });
 
-// Login
+// LOGIN
 app.post("/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({
-        error: "email and password required",
+        error: "Email and password are required",
       });
     }
 
-    const users = await getUsersCollection();
-    const user = await users.findOne({ email });
+    const normalizedEmail = email.trim().toLowerCase();
 
-    if (!user) {
+    const users = await getUsersCollection();
+
+    const user = await users.findOne({
+      email: normalizedEmail,
+    });
+
+    if (!user || !user.passwordHash) {
       return res.status(401).json({
-        error: "invalid credentials",
+        error: "Invalid email or password",
       });
     }
 
@@ -181,7 +236,7 @@ app.post("/auth/login", async (req, res) => {
 
     if (!match) {
       return res.status(401).json({
-        error: "invalid credentials",
+        error: "Invalid email or password",
       });
     }
 
@@ -191,40 +246,41 @@ app.post("/auth/login", async (req, res) => {
       name: user.name || "",
     };
 
-    req.session.user = profile;
-
-    req.session.save((err) => {
-      if (err) {
-        console.error("Session save error:", err);
+    req.session.regenerate((error) => {
+      if (error) {
+        console.error("Login session error:", error);
 
         return res.status(500).json({
-          error: "Failed to save login session",
+          error: "Failed to create login session",
         });
       }
 
-      return res.json({ user: profile });
+      req.session.user = profile;
+
+      req.session.save((saveError) => {
+        if (saveError) {
+          console.error("Login session save error:", saveError);
+
+          return res.status(500).json({
+            error: "Failed to save login session",
+          });
+        }
+
+        return res.json({
+          user: profile,
+        });
+      });
     });
-  } catch (err) {
-    console.error("Login error:", err);
+  } catch (error) {
+    console.error("Login error:", error);
 
     return res.status(500).json({
-      error: "login failed",
+      error: "Login failed",
     });
   }
 });
 
-app.get("/auth/me", (req, res) => {
-  return res.json({
-    authenticated: !!req.session.user,
-    user: req.session.user || null,
-  });
-});
-
-
-// ========================================
-// GOOGLE AUTHENTICATION
-// ========================================
-
+// GOOGLE LOGIN
 app.post("/auth/google", async (req, res) => {
   try {
     const { credential } = req.body;
@@ -235,7 +291,6 @@ app.post("/auth/google", async (req, res) => {
       });
     }
 
-    // Verify Google ID token
     const ticket = await googleClient.verifyIdToken({
       idToken: credential,
       audience: process.env.GOOGLE_CLIENT_ID,
@@ -243,7 +298,7 @@ app.post("/auth/google", async (req, res) => {
 
     const payload = ticket.getPayload();
 
-    if (!payload || !payload.email || !payload.email_verified) {
+    if (!payload?.email || !payload.email_verified) {
       return res.status(401).json({
         error: "Invalid or unverified Google account",
       });
@@ -255,16 +310,10 @@ app.post("/auth/google", async (req, res) => {
 
     const users = await getUsersCollection();
 
-    // Find an existing Google account
-    let user = await users.findOne({
-      googleId,
-    });
+    let user = await users.findOne({ googleId });
 
     if (!user) {
-      // Check whether this email already belongs to another account
-      const existingUser = await users.findOne({
-        email,
-      });
+      const existingUser = await users.findOne({ email });
 
       if (existingUser) {
         return res.status(409).json({
@@ -273,7 +322,6 @@ app.post("/auth/google", async (req, res) => {
         });
       }
 
-      // Create a new Google user
       const result = await users.insertOne({
         email,
         name,
@@ -287,24 +335,21 @@ app.post("/auth/google", async (req, res) => {
         _id: result.insertedId,
         email,
         name,
-        googleId,
       };
     }
 
-    // Prepare user profile
     const profile = {
       id: user._id.toString(),
       email: user.email,
       name: user.name || "",
     };
 
-    // Create a fresh session
-    req.session.regenerate((err) => {
-      if (err) {
-        console.error("Session regeneration error:", err);
+    req.session.regenerate((error) => {
+      if (error) {
+        console.error("Google session regeneration error:", error);
 
         return res.status(500).json({
-          error: "Failed to create login session",
+          error: "Failed to create Google login session",
         });
       }
 
@@ -315,7 +360,7 @@ app.post("/auth/google", async (req, res) => {
           console.error("Google session save error:", saveError);
 
           return res.status(500).json({
-            error: "Failed to save login session",
+            error: "Failed to save Google login session",
           });
         }
 
@@ -325,8 +370,8 @@ app.post("/auth/google", async (req, res) => {
         });
       });
     });
-  } catch (err) {
-    console.error("Google authentication error:", err);
+  } catch (error) {
+    console.error("Google authentication error:", error);
 
     return res.status(401).json({
       error: "Google authentication failed",
@@ -334,31 +379,40 @@ app.post("/auth/google", async (req, res) => {
   }
 });
 
-    
+// CURRENT USER
+app.get("/auth/me", (req, res) => {
+  return res.json({
+    authenticated: !!req.session.user,
+    user: req.session.user || null,
+  });
+});
 
-// Logout
+// LOGOUT
 app.post("/auth/logout", (req, res) => {
-  req.session.destroy((err) => {
-    if (err) {
+  req.session.destroy((error) => {
+    if (error) {
       return res.status(500).json({
-        error: "logout failed",
+        error: "Logout failed",
       });
     }
 
-    res.clearCookie("connect.sid");
+    res.clearCookie("greenlife.sid", {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: isProduction ? "none" : "lax",
+    });
 
     return res.json({
-      message: "logged out",
+      message: "Logged out successfully",
     });
   });
 });
 
-
+// ========================================
 // EVENT ROUTES
+// ========================================
 
-
-// GET ALL EVENTS
-
+// GET ALL EVENTS WITH ORGANIZER INFORMATION
 app.get("/events", async (req, res) => {
   try {
     const events = await getEventsCollection();
@@ -369,7 +423,6 @@ app.get("/events", async (req, res) => {
       .sort({ dateTime: 1 })
       .toArray();
 
-    // Get all valid organizer IDs
     const organizerIds = [
       ...new Set(
         result
@@ -378,7 +431,6 @@ app.get("/events", async (req, res) => {
       ),
     ];
 
-    // Fetch organizer information from users collection
     const organizers = await users
       .find({
         _id: {
@@ -416,8 +468,8 @@ app.get("/events", async (req, res) => {
     return res.json({
       events: formattedEvents,
     });
-  } catch (err) {
-    console.error("Get events error:", err);
+  } catch (error) {
+    console.error("Get events error:", error);
 
     return res.status(500).json({
       error: "Failed to get events",
@@ -425,11 +477,7 @@ app.get("/events", async (req, res) => {
   }
 });
 
-
 // CREATE EVENT
-// ========================================
-
-
 app.post("/events", requireAuth, async (req, res) => {
   try {
     const {
@@ -497,8 +545,8 @@ app.post("/events", requireAuth, async (req, res) => {
         id: result.insertedId.toString(),
       },
     });
-  } catch (err) {
-    console.error("Create event error:", err);
+  } catch (error) {
+    console.error("Create event error:", error);
 
     return res.status(500).json({
       error: "Failed to create event",
@@ -506,41 +554,7 @@ app.post("/events", requireAuth, async (req, res) => {
   }
 });
 
-
-// GET ALL EVENTS
-// ========================================
-
-app.get("/events", async (req, res) => {
-  try {
-    const events = await getEventsCollection();
-
-    const allEvents = await events
-      .find({})
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    const formattedEvents = allEvents.map(({ _id, ...event }) => ({
-      ...event,
-      id: _id.toString(),
-      attendeeIds: event.attendeeIds ?? [],
-    }));
-
-    return res.json({
-      events: formattedEvents,
-    });
-  } catch (err) {
-    console.error("Get events error:", err);
-
-    return res.status(500).json({
-      error: "Failed to get events",
-    });
-  }
-});
-
-
 // GET SINGLE EVENT
-// ========================================
-
 app.get("/events/:id", async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -570,8 +584,8 @@ app.get("/events/:id", async (req, res) => {
         attendeeIds: rest.attendeeIds ?? [],
       },
     });
-  } catch (err) {
-    console.error("Get event error:", err);
+  } catch (error) {
+    console.error("Get event error:", error);
 
     return res.status(500).json({
       error: "Failed to get event",
@@ -579,14 +593,13 @@ app.get("/events/:id", async (req, res) => {
   }
 });
 
-
 // JOIN EVENT
-// =================================
-
 app.post("/events/:id/join", requireAuth, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({ error: "Invalid event ID" });
+      return res.status(400).json({
+        error: "Invalid event ID",
+      });
     }
 
     const events = await getEventsCollection();
@@ -601,7 +614,9 @@ app.post("/events/:id/join", requireAuth, async (req, res) => {
     );
 
     if (result.matchedCount === 0) {
-      return res.status(404).json({ error: "Event not found" });
+      return res.status(404).json({
+        error: "Event not found",
+      });
     }
 
     const event = await events.findOne({
@@ -612,20 +627,22 @@ app.post("/events/:id/join", requireAuth, async (req, res) => {
       message: "Successfully joined the event",
       attendeeIds: event.attendeeIds ?? [],
     });
-  } catch (err) {
-    console.error("Join event error:", err);
-    return res.status(500).json({ error: "Failed to join event" });
+  } catch (error) {
+    console.error("Join event error:", error);
+
+    return res.status(500).json({
+      error: "Failed to join event",
+    });
   }
 });
 
-
 // LEAVE EVENT
-// ==================================
-
 app.delete("/events/:id/join", requireAuth, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({ error: "Invalid event ID" });
+      return res.status(400).json({
+        error: "Invalid event ID",
+      });
     }
 
     const events = await getEventsCollection();
@@ -640,7 +657,9 @@ app.delete("/events/:id/join", requireAuth, async (req, res) => {
     );
 
     if (result.matchedCount === 0) {
-      return res.status(404).json({ error: "Event not found" });
+      return res.status(404).json({
+        error: "Event not found",
+      });
     }
 
     const event = await events.findOne({
@@ -651,18 +670,16 @@ app.delete("/events/:id/join", requireAuth, async (req, res) => {
       message: "Successfully left the event",
       attendeeIds: event.attendeeIds ?? [],
     });
-  } catch (err) {
-    console.error("Leave event error:", err);
-    return res.status(500).json({ error: "Failed to leave event" });
+  } catch (error) {
+    console.error("Leave event error:", error);
+
+    return res.status(500).json({
+      error: "Failed to leave event",
+    });
   }
 });
 
-
-
-
-// DELETE EVENT (ONLY ORGANIZER)
-// ========================================
-
+// DELETE EVENT - ORGANIZER ONLY
 app.delete("/events/:id", requireAuth, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -687,8 +704,8 @@ app.delete("/events/:id", requireAuth, async (req, res) => {
     return res.json({
       message: "Event deleted successfully",
     });
-  } catch (err) {
-    console.error("Delete event error:", err);
+  } catch (error) {
+    console.error("Delete event error:", error);
 
     return res.status(500).json({
       error: "Failed to delete event",
@@ -696,11 +713,7 @@ app.delete("/events/:id", requireAuth, async (req, res) => {
   }
 });
 
-
-// UPDATE EVENT (ONLY ORGANIZER)
-// ========================================
-
-
+// UPDATE EVENT - ORGANIZER ONLY
 app.patch("/events/:id", requireAuth, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -746,8 +759,11 @@ app.patch("/events/:id", requireAuth, async (req, res) => {
       });
     }
 
-    const startDateTime = updates.dateTime ?? existingEvent.dateTime;
-    const endDateTime = updates.endDateTime ?? existingEvent.endDateTime;
+    const startDateTime =
+      updates.dateTime ?? existingEvent.dateTime;
+
+    const endDateTime =
+      updates.endDateTime ?? existingEvent.endDateTime;
 
     if (!startDateTime || !endDateTime) {
       return res.status(400).json({
@@ -802,8 +818,8 @@ app.patch("/events/:id", requireAuth, async (req, res) => {
         attendeeIds: rest.attendeeIds ?? [],
       },
     });
-  } catch (err) {
-    console.error("Update event error:", err);
+  } catch (error) {
+    console.error("Update event error:", error);
 
     return res.status(500).json({
       error: "Failed to update event",
@@ -811,8 +827,8 @@ app.patch("/events/:id", requireAuth, async (req, res) => {
   }
 });
 
-
-// HOME ROUTE
+// ========================================
+// HOME AND HEALTH ROUTES
 // ========================================
 
 app.get("/", (req, res) => {
@@ -821,17 +837,42 @@ app.get("/", (req, res) => {
   });
 });
 
-
-// START SERVER
-// ========================================
-
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
-
 app.get("/health", (req, res) => {
   res.status(200).json({
     status: "OK",
     message: "GreenLife API is running",
   });
 });
+
+// ========================================
+// ERROR HANDLER
+// ========================================
+
+app.use((error, req, res, next) => {
+  console.error("Unhandled server error:", error);
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return res.status(500).json({
+    error: "Internal server error",
+  });
+});
+
+// ========================================
+// VERCEL EXPORT
+// ========================================
+
+// Do not use app.listen() when deploying this Express app
+// as a Vercel serverless application.
+
+const PORT = Number(process.env.PORT) || 5001;
+
+if (!process.env.VERCEL) {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`GreenLife server running on port ${PORT}`);
+  });
+}
+
+export default app;
