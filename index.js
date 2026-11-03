@@ -733,7 +733,9 @@ app.use((error, req, res, next) => {
 // START SERVER
 // --------------------------------------------------
 
-if (!process.env.NETLIFY) {
+const isNetlify = process.env.NETLIFY === "true";
+
+if (!isNetlify) {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`GreenLife server running on port ${PORT}`);
   });
