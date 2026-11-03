@@ -1,0 +1,14 @@
+[build]
+  command = "npm install"
+  publish = "public"
+
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = ["express", "mongodb", "connect-mongo", "google-auth-library", "bcryptjs"]
+
+# Send every request to the Express API function
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
