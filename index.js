@@ -61,7 +61,13 @@ async function connectToMongoDB() {
     throw new Error("MONGODB_URI is not configured");
   }
 
-  const newClient = new MongoClient(process.env.MONGODB_URI);
+  const newClient = new MongoClient(process.env.MONGODB_URI, {
+    serverSelectionTimeoutMS: 30000,
+    connectTimeoutMS: 30000,
+    socketTimeoutMS: 45000,
+    maxPoolSize: 10,
+    minPoolSize: 0,
+  });
 
   try {
     await newClient.connect();
