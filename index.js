@@ -1,33 +1,60 @@
-
 import express from "express";
 import cors from "cors";
 import session from "express-session";
-import { MongoStore } from "connect-mongo";
+import MongoStore from "connect-mongo";
 import bcrypt from "bcryptjs";
 import { MongoClient, ObjectId } from "mongodb";
 import { OAuth2Client } from "google-auth-library";
 import "dotenv/config";
 
+// --------------------------------------------------
+// APP CONFIGURATION
+// --------------------------------------------------
+
 const app = express();
 const PORT = Number(process.env.PORT) || 5001;
-
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 const isProduction = process.env.NODE_ENV === "production";
 
+const googleClient = new OAuth2Client(
+  process.env.GOOGLE_CLIENT_ID
+);
+
 // --------------------------------------------------
-// CORS CONFIGURATION
+// ENVIRONMENT VALIDATION
 // --------------------------------------------------
+
+if (!process.env.MONGODB_URI) {
+  throw new Error("MONGODB_URI is missing from .env");
+}
+
+if (!process.env.SESSION_SECRET) {
+  throw new Error("SESSION_SECRET is missing from .env");
+}
+
+if (!process.env.GOOGLE_CLIENT_ID) {
+  throw new Error("GOOGLE_CLIENT_ID is missing from .env");
+}
+
+
+// --------------------------------------------------
+// MIDDLEWARE
+// --------------------------------------------------
+
+if (isProduction) {
+  app.set("trust proxy", 1);
+}
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const allowedOrigins = [
   "http://localhost:3000",
   "https://greenlife-client.vercel.app",
   "https://greenlife-client.netlify.app",
-  process.env.FRONTEND_URL?.replace(/\/$/, ""),
-].filter(Boolean);
-
-if (isProduction) {
-  app.set("trust proxy", 1);
-}
+  process.env.FRONTEND_URL,
+]
+  .filter(Boolean)
+  .map((origin) => origin.replace(/\/$/, ""));
 
 app.use(
   cors({
@@ -39,7 +66,7 @@ app.use(
       }
 
       console.error("CORS blocked origin:", origin);
-      return callback(new Error(`Origin not allowed by CORS: ${origin}`));
+      return callback(new Error("Origin not allowed by CORS"));
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -47,45 +74,136 @@ app.use(
   })
 );
 
-app.use(express.json());
+
+// --------------------------------------------------
+// SESSION MIDDLEWARE
+// --------------------------------------------------
+
+app.use(
+  session({
+    name: "greenlife.sid",
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+
+    store: MongoStore.create({
+      mongoUrl: process.env.MONGODB_URI,
+      dbName: process.env.MONGODB_DB || "greenlife",
+      collectionName: "sessions",
+    }),
+
+    cookie: {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: isProduction ? "none" : "lax",
+      maxAge: 24 * 60 * 60 * 1000,
+    },
+  })
+);
+
+
+
+
+
+//------------------------
+//check if the server is running in production mode
+//------------------------
+app.get("/test-session", async (req, res) => {
+  try {
+    console.log("Session test started");
+    console.log("Session ID:", req.sessionID);
+    console.log("Session available:", Boolean(req.session));
+
+    req.session.testValue = "GreenLife session works";
+
+    await new Promise((resolve, reject) => {
+      req.session.save((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+
+    res.json({
+      success: true,
+      sessionID: req.sessionID,
+      message: "Session saved successfully",
+    });
+  } catch (error) {
+    console.error("SESSION TEST ERROR:", error);
+
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+app.get("/check-session", (req, res) => {
+  res.json({
+    success: true,
+    sessionID: req.sessionID,
+    testValue: req.session?.testValue || null,
+    sessionWorks: req.session?.testValue === "GreenLife session works",
+  });
+});app.get("/test-session-now", (req, res) => {
+  req.session.testValue = "GreenLife session works";
+
+  req.session.save((error) => {
+    if (error) {
+      return res.status(500).json({
+        success: false,
+        error: error.message,
+      });
+    }
+
+    res.json({
+      success: true,
+      sessionID: req.sessionID,
+      testValue: req.session.testValue,
+      sessionWorks: true,
+    });
+  });
+});
 
 // --------------------------------------------------
 // MONGODB CONNECTION
 // --------------------------------------------------
 
 let client;
+let connectionPromise;
 
 async function connectToMongoDB() {
   if (client) return client;
 
-  if (!process.env.MONGODB_URI) {
-    throw new Error("MONGODB_URI is not configured");
+  if (!connectionPromise) {
+    const newClient = new MongoClient(process.env.MONGODB_URI, {
+      serverSelectionTimeoutMS: 30000,
+      connectTimeoutMS: 30000,
+      maxPoolSize: 10,
+    });
+
+    connectionPromise = newClient
+      .connect()
+      .then(() => {
+        client = newClient;
+        console.log("Successfully connected to MongoDB!");
+        return client;
+      })
+      .catch(async (error) => {
+        connectionPromise = null;
+        await newClient.close().catch(() => {});
+        throw error;
+      });
   }
 
-  const newClient = new MongoClient(process.env.MONGODB_URI, {
-    serverSelectionTimeoutMS: 30000,
-    connectTimeoutMS: 30000,
-    socketTimeoutMS: 45000,
-    maxPoolSize: 10,
-    minPoolSize: 0,
-  });
-
-  try {
-    await newClient.connect();
-    client = newClient;
-    console.log("Successfully connected to MongoDB!");
-    return client;
-  } catch (error) {
-    await newClient.close().catch(() => {});
-    console.error("MongoDB connection failed:", error);
-    throw error;
-  }
+  return connectionPromise;
 }
 
 async function getCollection(collectionName) {
   const connectedClient = await connectToMongoDB();
 
-  const db = connectedClient.db(process.env.MONGODB_DB || "greenlife");
+  const db = connectedClient.db(
+    process.env.MONGODB_DB || "greenlife"
+  );
 
   return db.collection(collectionName);
 }
@@ -97,33 +215,13 @@ const getEventsCollection = () => getCollection("events");
 // SESSION CONFIGURATION
 // --------------------------------------------------
 
-app.use(
-  session({
-    name: "greenlife.sid",
-    secret: process.env.SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    store: MongoStore.create({
-      mongoUrl: process.env.MONGODB_URI,
-      dbName: process.env.MONGODB_DB || "greenlife",
-      collectionName: "sessions",
-      touchAfter: 24 * 60 * 60,
-    }),
-    cookie: {
-      httpOnly: true,
-      secure: isProduction,
-      sameSite: isProduction ? "none" : "lax",
-      maxAge: 1000 * 60 * 60 * 24,
-    },
-  })
-);
 
 // --------------------------------------------------
-// AUTH MIDDLEWARE
+// AUTH HELPERS
 // --------------------------------------------------
 
 function requireAuth(req, res, next) {
-  if (!req.session.user) {
+  if (!req.session?.user) {
     return res.status(401).json({
       success: false,
       message: "Please login first",
@@ -132,6 +230,36 @@ function requireAuth(req, res, next) {
 
   next();
 }
+function createSession(req, user) {
+  return new Promise((resolve, reject) => {
+    req.session.regenerate((error) => {
+      if (error) return reject(error);
+
+      console.log("SESSION REGENERATED:", req.sessionID);
+
+      req.session.user = {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        picture: user.picture || "",
+      };
+
+      console.log("USER ASSIGNED:", req.session.user);
+
+      req.session.save((saveError) => {
+        if (saveError) {
+          console.error("SESSION SAVE ERROR:", saveError);
+          return reject(saveError);
+        }
+
+        console.log("SESSION SAVED:", req.sessionID);
+        console.log("SAVED SESSION USER:", req.session.user);
+
+        resolve(req.session.user);
+      });
+    });
+  });
+}
 
 // --------------------------------------------------
 // ROOT & HEALTH CHECK
@@ -139,6 +267,7 @@ function requireAuth(req, res, next) {
 
 app.get("/", (req, res) => {
   res.json({
+    success: true,
     message: "GreenLife server is running",
   });
 });
@@ -156,18 +285,24 @@ app.get("/health", (req, res) => {
 
 app.post("/auth/register", async (req, res, next) => {
   try {
-    const { name, email, password } = req.body;
+    const { name, email, password } = req.body || {};
 
-    if (!name || !email || !password) {
+    if (!name?.trim() || !email?.trim() || !password) {
       return res.status(400).json({
         success: false,
         message: "Name, email and password are required",
       });
     }
 
-    const users = await getUsersCollection();
+    if (password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 characters",
+      });
+    }
 
     const normalizedEmail = email.toLowerCase().trim();
+    const users = await getUsersCollection();
 
     const existingUser = await users.findOne({
       email: normalizedEmail,
@@ -180,40 +315,39 @@ app.post("/auth/register", async (req, res, next) => {
       });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 12);
-
     const newUser = {
       name: name.trim(),
       email: normalizedEmail,
-      password: hashedPassword,
+      password: await bcrypt.hash(password, 12),
+      picture: "",
       createdAt: new Date(),
     };
 
     const result = await users.insertOne(newUser);
 
-    req.session.user = {
-      id: result.insertedId.toString(),
-      name: newUser.name,
-      email: newUser.email,
-    };
+    const sessionUser = await createSession(req, {
+      ...newUser,
+      _id: result.insertedId,
+    });
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       message: "Registration successful",
-      user: req.session.user,
+      user: sessionUser,
     });
   } catch (error) {
+    console.error("Registration error:", error);
     next(error);
   }
 });
 
 // --------------------------------------------------
-// LOGIN
+// EMAIL/PASSWORD LOGIN
 // --------------------------------------------------
 
 app.post("/auth/login", async (req, res, next) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
 
     if (!email || !password) {
       return res.status(400).json({
@@ -228,7 +362,7 @@ app.post("/auth/login", async (req, res, next) => {
       email: email.toLowerCase().trim(),
     });
 
-    if (!user || !user.password) {
+    if (!user?.password) {
       return res.status(401).json({
         success: false,
         message: "Invalid email or password",
@@ -247,26 +381,15 @@ app.post("/auth/login", async (req, res, next) => {
       });
     }
 
-    req.session.regenerate((error) => {
-      if (error) return next(error);
+    const sessionUser = await createSession(req, user);
 
-      req.session.user = {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-      };
-
-      req.session.save((saveError) => {
-        if (saveError) return next(saveError);
-
-        res.json({
-          success: true,
-          message: "Login successful",
-          user: req.session.user,
-        });
-      });
+    return res.json({
+      success: true,
+      message: "Login successful",
+      user: sessionUser,
     });
   } catch (error) {
+    console.error("Login error:", error);
     next(error);
   }
 });
@@ -277,7 +400,7 @@ app.post("/auth/login", async (req, res, next) => {
 
 app.post("/auth/google", async (req, res, next) => {
   try {
-    const { credential } = req.body;
+    const credential = req.body?.credential;
 
     if (!credential) {
       return res.status(400).json({
@@ -301,14 +424,16 @@ app.post("/auth/google", async (req, res, next) => {
     }
 
     const users = await getUsersCollection();
-    const email = payload.email.toLowerCase();
+    const email = payload.email.toLowerCase().trim();
 
-    let user = await users.findOne({ googleId: payload.sub });
+    let user = await users.findOne({
+      googleId: payload.sub,
+    });
 
     if (!user) {
       user = await users.findOne({ email });
 
-      if (user && user.googleId && user.googleId !== payload.sub) {
+      if (user?.googleId && user.googleId !== payload.sub) {
         return res.status(409).json({
           success: false,
           message: "This email is linked to another Google account",
@@ -321,10 +446,13 @@ app.post("/auth/google", async (req, res, next) => {
           {
             $set: {
               googleId: payload.sub,
-              picture: payload.picture || "",
+              picture: payload.picture || user.picture || "",
             },
           }
         );
+
+        user.googleId = payload.sub;
+        user.picture = payload.picture || user.picture || "";
       } else {
         const newUser = {
           name: payload.name || "Google User",
@@ -335,49 +463,67 @@ app.post("/auth/google", async (req, res, next) => {
         };
 
         const result = await users.insertOne(newUser);
-        user = { ...newUser, _id: result.insertedId };
+
+        user = {
+          ...newUser,
+          _id: result.insertedId,
+        };
       }
     }
 
-    req.session.regenerate((error) => {
-      if (error) return next(error);
+    const sessionUser = await createSession(req, user);
 
-      req.session.user = {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        picture: user.picture || payload.picture || "",
-      };
+    console.log("Google login successful:", email);
 
-      req.session.save((saveError) => {
-        if (saveError) return next(saveError);
-
-        res.json({
-          success: true,
-          message: "Google login successful",
-          user: req.session.user,
-        });
-      });
+    return res.json({
+      success: true,
+      message: "Google login successful",
+      user: sessionUser,
     });
   } catch (error) {
     console.error("Google login error:", error);
+
+    if (
+      error.message?.includes("Wrong recipient") ||
+      error.message?.includes("audience")
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Google Client ID does not match",
+      });
+    }
+
     next(error);
   }
 });
 
 // --------------------------------------------------
-// GET CURRENT USER
+// CURRENT AUTHENTICATED USER
 // --------------------------------------------------
 
+
+
 app.get("/auth/me", (req, res) => {
-  if (!req.session.user) {
-    return res.json({
+  console.log("\n========== AUTH CHECK ==========");
+  console.log("Session ID:", req.sessionID);
+  console.log("Session exists:", Boolean(req.session));
+  console.log("Session user:", req.session?.user);
+  console.log("Cookie received:", Boolean(req.headers.cookie));
+
+  if (!req.session?.user) {
+    console.log("STATUS: NOT AUTHENTICATED");
+
+    return res.status(200).json({
+      success: true,
       authenticated: false,
       user: null,
     });
   }
 
-  res.json({
+  console.log("STATUS: AUTHENTICATED");
+
+  return res.status(200).json({
+    success: true,
     authenticated: true,
     user: req.session.user,
   });
@@ -397,7 +543,7 @@ app.post("/auth/logout", (req, res, next) => {
       sameSite: isProduction ? "none" : "lax",
     });
 
-    res.json({
+    return res.json({
       success: true,
       message: "Logged out successfully",
     });
@@ -421,8 +567,8 @@ app.get("/events", async (req, res, next) => {
     const organizerIds = [
       ...new Set(
         events
-          .map((event) => event.organizerId)
-          .filter((id) => id && ObjectId.isValid(id))
+          .map((event) => String(event.organizerId || ""))
+          .filter(ObjectId.isValid)
       ),
     ];
 
@@ -441,14 +587,31 @@ app.get("/events", async (req, res, next) => {
       organizers.map((user) => [user._id.toString(), user])
     );
 
-    const formattedEvents = events.map((event) => ({
-      ...event,
-      _id: event._id.toString(),
-      organizer:
-        organizerMap.get(event.organizerId)?.name || "Unknown Organizer",
-    }));
+    const formattedEvents = events.map((event) => {
+      const organizer = organizerMap.get(
+        String(event.organizerId || "")
+      );
 
-    res.json({
+      return {
+        ...event,
+        id: event._id.toString(),
+        _id: event._id.toString(),
+        attendeeIds: event.attendeeIds ?? event.participants ?? [],
+        organizer: organizer
+          ? {
+              name: organizer.name || "Unknown Organizer",
+              email: organizer.email || "",
+              avatarUrl: organizer.avatarUrl || organizer.picture || "",
+            }
+          : {
+              name: "Unknown Organizer",
+              email: "",
+              avatarUrl: "",
+            },
+      };
+    });
+
+    return res.json({
       success: true,
       events: formattedEvents,
     });
@@ -486,14 +649,39 @@ app.get("/events/:id", async (req, res, next) => {
       });
     }
 
-    res.json({
+    const users = await getUsersCollection();
+
+    const organizer = ObjectId.isValid(
+      String(event.organizerId || "")
+    )
+      ? await users.findOne(
+          { _id: new ObjectId(String(event.organizerId)) },
+          { projection: { password: 0 } }
+        )
+      : null;
+
+    return res.json({
       success: true,
       event: {
         ...event,
+        id: event._id.toString(),
         _id: event._id.toString(),
+        attendeeIds: event.attendeeIds ?? event.participants ?? [],
+        organizer: organizer
+          ? {
+              name: organizer.name || "Unknown Organizer",
+              email: organizer.email || "",
+              avatarUrl: organizer.avatarUrl || organizer.picture || "",
+            }
+          : {
+              name: "Unknown Organizer",
+              email: "",
+              avatarUrl: "",
+            },
       },
     });
   } catch (error) {
+    console.error("GET SINGLE EVENT error:", error);
     next(error);
   }
 });
@@ -504,26 +692,76 @@ app.get("/events/:id", async (req, res, next) => {
 
 app.post("/events", requireAuth, async (req, res, next) => {
   try {
+    const {
+      title,
+      description,
+      location,
+      dateTime,
+      endDateTime,
+      category,
+      imageUrl,
+    } = req.body || {};
+
+    if (
+      !title?.trim() ||
+      !description?.trim() ||
+      !location?.trim() ||
+      !dateTime ||
+      !endDateTime ||
+      !category?.trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide all required event fields",
+      });
+    }
+
+    const start = new Date(dateTime);
+    const end = new Date(endDateTime);
+
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime()) ||
+      end <= start
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "End time must be after start time",
+      });
+    }
+
     const events = await getEventsCollection();
 
     const eventData = {
-      ...req.body,
+      title: title.trim(),
+      description: description.trim(),
+      location: location.trim(),
+      dateTime,
+      endDateTime,
+      category: category.trim(),
+      imageUrl: imageUrl || "",
       organizerId: req.session.user.id,
+      attendeeIds: [],
       createdAt: new Date(),
-      participants: [],
     };
 
     const result = await events.insertOne(eventData);
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       message: "Event created successfully",
       event: {
         ...eventData,
+        id: result.insertedId.toString(),
         _id: result.insertedId.toString(),
+        organizer: {
+          name: req.session.user.name,
+          email: req.session.user.email,
+        },
       },
     });
   } catch (error) {
+    console.error("CREATE EVENT error:", error);
     next(error);
   }
 });
@@ -544,11 +782,17 @@ app.post("/events/:id/join", requireAuth, async (req, res, next) => {
     }
 
     const events = await getEventsCollection();
-    const userId = req.session.user.id;
 
     const result = await events.updateOne(
       { _id: new ObjectId(id) },
-      { $addToSet: { participants: userId } }
+      {
+        $addToSet: {
+          attendeeIds: req.session.user.id,
+        },
+        $pull: {
+          participants: req.session.user.id,
+        },
+      }
     );
 
     if (!result.matchedCount) {
@@ -558,11 +802,12 @@ app.post("/events/:id/join", requireAuth, async (req, res, next) => {
       });
     }
 
-    res.json({
+    return res.json({
       success: true,
       message: "Joined event successfully",
     });
   } catch (error) {
+    console.error("JOIN EVENT error:", error);
     next(error);
   }
 });
@@ -586,7 +831,12 @@ app.delete("/events/:id/join", requireAuth, async (req, res, next) => {
 
     const result = await events.updateOne(
       { _id: new ObjectId(id) },
-      { $pull: { participants: req.session.user.id } }
+      {
+        $pull: {
+          attendeeIds: req.session.user.id,
+          participants: req.session.user.id,
+        },
+      }
     );
 
     if (!result.matchedCount) {
@@ -596,11 +846,12 @@ app.delete("/events/:id/join", requireAuth, async (req, res, next) => {
       });
     }
 
-    res.json({
+    return res.json({
       success: true,
       message: "Left event successfully",
     });
   } catch (error) {
+    console.error("LEAVE EVENT error:", error);
     next(error);
   }
 });
@@ -634,11 +885,12 @@ app.delete("/events/:id", requireAuth, async (req, res, next) => {
       });
     }
 
-    res.json({
+    return res.json({
       success: true,
       message: "Event deleted successfully",
     });
   } catch (error) {
+    console.error("DELETE EVENT error:", error);
     next(error);
   }
 });
@@ -661,18 +913,17 @@ app.patch("/events/:id", requireAuth, async (req, res, next) => {
     const allowedFields = [
       "title",
       "description",
-      "date",
-      "time",
       "location",
+      "dateTime",
+      "endDateTime",
       "category",
-      "image",
-      "capacity",
+      "imageUrl",
     ];
 
     const updates = {};
 
     for (const field of allowedFields) {
-      if (req.body[field] !== undefined) {
+      if (req.body?.[field] !== undefined) {
         updates[field] = req.body[field];
       }
     }
@@ -684,11 +935,42 @@ app.patch("/events/:id", requireAuth, async (req, res, next) => {
       });
     }
 
-    updates.updatedAt = new Date();
-
     const events = await getEventsCollection();
 
-    const result = await events.updateOne(
+    const existingEvent = await events.findOne({
+      _id: new ObjectId(id),
+      organizerId: req.session.user.id,
+    });
+
+    if (!existingEvent) {
+      return res.status(404).json({
+        success: false,
+        message: "Event not found or you are not the organizer",
+      });
+    }
+
+    const start = new Date(
+      updates.dateTime ?? existingEvent.dateTime
+    );
+
+    const end = new Date(
+      updates.endDateTime ?? existingEvent.endDateTime
+    );
+
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime()) ||
+      end <= start
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Event end time must be after start time",
+      });
+    }
+
+    updates.updatedAt = new Date();
+
+    await events.updateOne(
       {
         _id: new ObjectId(id),
         organizerId: req.session.user.id,
@@ -696,18 +978,12 @@ app.patch("/events/:id", requireAuth, async (req, res, next) => {
       { $set: updates }
     );
 
-    if (!result.matchedCount) {
-      return res.status(404).json({
-        success: false,
-        message: "Event not found or you are not the organizer",
-      });
-    }
-
-    res.json({
+    return res.json({
       success: true,
       message: "Event updated successfully",
     });
   } catch (error) {
+    console.error("UPDATE EVENT error:", error);
     next(error);
   }
 });
@@ -723,10 +999,11 @@ app.use((error, req, res, next) => {
     return next(error);
   }
 
-  res.status(500).json({
+  return res.status(500).json({
     success: false,
-    message: "Internal server error",
-    error: isProduction ? undefined : error.message,
+    message: isProduction
+      ? "Internal server error"
+      : error.message || "Internal server error",
   });
 });
 
