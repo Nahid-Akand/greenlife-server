@@ -21,6 +21,7 @@ const isProduction = process.env.NODE_ENV === "production";
 const allowedOrigins = [
   "http://localhost:3000",
   "https://greenlife-client.vercel.app",
+  "https://greenlife-client.netlify.app",
   process.env.FRONTEND_URL?.replace(/\/$/, ""),
 ].filter(Boolean);
 
