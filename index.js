@@ -9,77 +9,53 @@ import { OAuth2Client } from "google-auth-library";
 import "dotenv/config";
 
 const app = express();
+const PORT = Number(process.env.PORT) || 5001;
+
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-
-// ========================================
-// ENVIRONMENT CONFIGURATION
-// ========================================
-
 const isProduction = process.env.NODE_ENV === "production";
+
+// --------------------------------------------------
+// CORS CONFIGURATION
+// --------------------------------------------------
 
 const allowedOrigins = [
   "http://localhost:3000",
-  process.env.FRONTEND_URL,
+  "https://greenlife-client.vercel.app",
+  process.env.FRONTEND_URL?.replace(/\/$/, ""),
 ].filter(Boolean);
 
-// Vercel runs behind a proxy.
 if (isProduction) {
   app.set("trust proxy", 1);
 }
 
-// ========================================
-// MIDDLEWARE
-// ========================================
-
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow requests without an Origin header (e.g. health checks).
-      if (!origin || allowedOrigins.includes(origin)) {
+      const normalizedOrigin = origin?.replace(/\/$/, "");
+
+      if (!origin || allowedOrigins.includes(normalizedOrigin)) {
         return callback(null, true);
       }
 
-      return callback(new Error("Origin not allowed by CORS"));
+      console.error("CORS blocked origin:", origin);
+      return callback(new Error(`Origin not allowed by CORS: ${origin}`));
     },
     credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
 app.use(express.json());
 
-app.use(
-  session({
-    name: "greenlife.sid",
-    secret: process.env.SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-
-    store: MongoStore.create({
-      mongoUrl: process.env.MONGODB_URI,
-      dbName: process.env.MONGODB_DB || "greenlife",
-      collectionName: "sessions",
-      touchAfter: 24 * 60 * 60,
-    }),
-
-    cookie: {
-      httpOnly: true,
-      secure: isProduction,
-      sameSite: isProduction ? "none" : "lax",
-      maxAge: 1000 * 60 * 60 * 24,
-    },
-  })
-);
-
-// ========================================
+// --------------------------------------------------
 // MONGODB CONNECTION
-// ========================================
+// --------------------------------------------------
 
 let client;
 
 async function connectToMongoDB() {
-  if (client) {
-    return client;
-  }
+  if (client) return client;
 
   if (!process.env.MONGODB_URI) {
     throw new Error("MONGODB_URI is not configured");
@@ -90,9 +66,7 @@ async function connectToMongoDB() {
   try {
     await newClient.connect();
     client = newClient;
-
     console.log("Successfully connected to MongoDB!");
-
     return client;
   } catch (error) {
     await newClient.close().catch(() => {});
@@ -101,193 +75,207 @@ async function connectToMongoDB() {
   }
 }
 
-async function getUsersCollection() {
-  const mongoClient = await connectToMongoDB();
-  const db = mongoClient.db(process.env.MONGODB_DB || "greenlife");
+async function getCollection(collectionName) {
+  const connectedClient = await connectToMongoDB();
 
-  return db.collection("users");
+  const db = connectedClient.db(process.env.MONGODB_DB || "greenlife");
+
+  return db.collection(collectionName);
 }
 
-async function getEventsCollection() {
-  const mongoClient = await connectToMongoDB();
-  const db = mongoClient.db(process.env.MONGODB_DB || "greenlife");
+const getUsersCollection = () => getCollection("users");
+const getEventsCollection = () => getCollection("events");
 
-  return db.collection("events");
-}
+// --------------------------------------------------
+// SESSION CONFIGURATION
+// --------------------------------------------------
 
-// ========================================
-// AUTHENTICATION MIDDLEWARE
-// ========================================
+app.use(
+  session({
+    name: "greenlife.sid",
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    store: MongoStore.create({
+      mongoUrl: process.env.MONGODB_URI,
+      dbName: process.env.MONGODB_DB || "greenlife",
+      collectionName: "sessions",
+      touchAfter: 24 * 60 * 60,
+    }),
+    cookie: {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: isProduction ? "none" : "lax",
+      maxAge: 1000 * 60 * 60 * 24,
+    },
+  })
+);
+
+// --------------------------------------------------
+// AUTH MIDDLEWARE
+// --------------------------------------------------
 
 function requireAuth(req, res, next) {
   if (!req.session.user) {
     return res.status(401).json({
-      error: "Please login first",
+      success: false,
+      message: "Please login first",
     });
   }
 
   next();
 }
 
-// ========================================
-// AUTH ROUTES
-// ========================================
+// --------------------------------------------------
+// ROOT & HEALTH CHECK
+// --------------------------------------------------
 
+app.get("/", (req, res) => {
+  res.json({
+    message: "GreenLife server is running",
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    success: true,
+    message: "Server is healthy",
+  });
+});
+
+// --------------------------------------------------
 // REGISTER
-app.post("/auth/register", async (req, res) => {
+// --------------------------------------------------
+
+app.post("/auth/register", async (req, res, next) => {
   try {
-    const { email, password, name } = req.body;
+    const { name, email, password } = req.body;
 
-    if (!email || !password) {
+    if (!name || !email || !password) {
       return res.status(400).json({
-        error: "Email and password are required",
-      });
-    }
-
-    const normalizedEmail = email.trim().toLowerCase();
-
-    if (password.length < 8) {
-      return res.status(400).json({
-        error: "Password must be at least 8 characters",
+        success: false,
+        message: "Name, email and password are required",
       });
     }
 
     const users = await getUsersCollection();
 
-    const existing = await users.findOne({
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const existingUser = await users.findOne({
       email: normalizedEmail,
     });
 
-    if (existing) {
+    if (existingUser) {
       return res.status(409).json({
-        error: "Email already registered",
+        success: false,
+        message: "Email already registered",
       });
     }
 
-    const passwordHash = await bcrypt.hash(password, 10);
+    const hashedPassword = await bcrypt.hash(password, 12);
 
-    const result = await users.insertOne({
+    const newUser = {
+      name: name.trim(),
       email: normalizedEmail,
-      passwordHash,
-      name: name?.trim() || "",
-      authProvider: "local",
+      password: hashedPassword,
       createdAt: new Date(),
-    });
-
-    const profile = {
-      id: result.insertedId.toString(),
-      email: normalizedEmail,
-      name: name?.trim() || "",
     };
 
-    req.session.user = profile;
+    const result = await users.insertOne(newUser);
 
-    req.session.save((error) => {
-      if (error) {
-        console.error("Registration session error:", error);
+    req.session.user = {
+      id: result.insertedId.toString(),
+      name: newUser.name,
+      email: newUser.email,
+    };
 
-        return res.status(500).json({
-          error: "Failed to save registration session",
-        });
-      }
-
-      return res.status(201).json({
-        user: profile,
-      });
+    res.status(201).json({
+      success: true,
+      message: "Registration successful",
+      user: req.session.user,
     });
   } catch (error) {
-    console.error("Registration error:", error);
-
-    return res.status(500).json({
-      error: "Registration failed",
-    });
+    next(error);
   }
 });
 
+// --------------------------------------------------
 // LOGIN
-app.post("/auth/login", async (req, res) => {
+// --------------------------------------------------
+
+app.post("/auth/login", async (req, res, next) => {
   try {
     const { email, password } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({
-        error: "Email and password are required",
+        success: false,
+        message: "Email and password are required",
       });
     }
-
-    const normalizedEmail = email.trim().toLowerCase();
 
     const users = await getUsersCollection();
 
     const user = await users.findOne({
-      email: normalizedEmail,
+      email: email.toLowerCase().trim(),
     });
 
-    if (!user || !user.passwordHash) {
+    if (!user || !user.password) {
       return res.status(401).json({
-        error: "Invalid email or password",
+        success: false,
+        message: "Invalid email or password",
       });
     }
 
-    const match = await bcrypt.compare(
+    const isPasswordValid = await bcrypt.compare(
       password,
-      user.passwordHash
+      user.password
     );
 
-    if (!match) {
+    if (!isPasswordValid) {
       return res.status(401).json({
-        error: "Invalid email or password",
+        success: false,
+        message: "Invalid email or password",
       });
     }
 
-    const profile = {
-      id: user._id.toString(),
-      email: user.email,
-      name: user.name || "",
-    };
-
     req.session.regenerate((error) => {
-      if (error) {
-        console.error("Login session error:", error);
+      if (error) return next(error);
 
-        return res.status(500).json({
-          error: "Failed to create login session",
-        });
-      }
-
-      req.session.user = profile;
+      req.session.user = {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+      };
 
       req.session.save((saveError) => {
-        if (saveError) {
-          console.error("Login session save error:", saveError);
+        if (saveError) return next(saveError);
 
-          return res.status(500).json({
-            error: "Failed to save login session",
-          });
-        }
-
-        return res.json({
-          user: profile,
+        res.json({
+          success: true,
+          message: "Login successful",
+          user: req.session.user,
         });
       });
     });
   } catch (error) {
-    console.error("Login error:", error);
-
-    return res.status(500).json({
-      error: "Login failed",
-    });
+    next(error);
   }
 });
 
+// --------------------------------------------------
 // GOOGLE LOGIN
-app.post("/auth/google", async (req, res) => {
+// --------------------------------------------------
+
+app.post("/auth/google", async (req, res, next) => {
   try {
     const { credential } = req.body;
 
     if (!credential) {
       return res.status(400).json({
-        error: "Google credential is required",
+        success: false,
+        message: "Google credential is required",
       });
     }
 
@@ -300,101 +288,101 @@ app.post("/auth/google", async (req, res) => {
 
     if (!payload?.email || !payload.email_verified) {
       return res.status(401).json({
-        error: "Invalid or unverified Google account",
+        success: false,
+        message: "Google email is not verified",
       });
     }
-
-    const googleId = payload.sub;
-    const email = payload.email.toLowerCase();
-    const name = payload.name || "";
 
     const users = await getUsersCollection();
+    const email = payload.email.toLowerCase();
 
-    let user = await users.findOne({ googleId });
+    let user = await users.findOne({ googleId: payload.sub });
 
     if (!user) {
-      const existingUser = await users.findOne({ email });
+      user = await users.findOne({ email });
 
-      if (existingUser) {
+      if (user && user.googleId && user.googleId !== payload.sub) {
         return res.status(409).json({
-          error:
-            "An account with this email already exists. Please login using your password first.",
+          success: false,
+          message: "This email is linked to another Google account",
         });
       }
 
-      const result = await users.insertOne({
-        email,
-        name,
-        googleId,
-        authProvider: "google",
-        emailVerified: true,
-        createdAt: new Date(),
-      });
+      if (user) {
+        await users.updateOne(
+          { _id: user._id },
+          {
+            $set: {
+              googleId: payload.sub,
+              picture: payload.picture || "",
+            },
+          }
+        );
+      } else {
+        const newUser = {
+          name: payload.name || "Google User",
+          email,
+          googleId: payload.sub,
+          picture: payload.picture || "",
+          createdAt: new Date(),
+        };
 
-      user = {
-        _id: result.insertedId,
-        email,
-        name,
-      };
+        const result = await users.insertOne(newUser);
+        user = { ...newUser, _id: result.insertedId };
+      }
     }
 
-    const profile = {
-      id: user._id.toString(),
-      email: user.email,
-      name: user.name || "",
-    };
-
     req.session.regenerate((error) => {
-      if (error) {
-        console.error("Google session regeneration error:", error);
+      if (error) return next(error);
 
-        return res.status(500).json({
-          error: "Failed to create Google login session",
-        });
-      }
-
-      req.session.user = profile;
+      req.session.user = {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        picture: user.picture || payload.picture || "",
+      };
 
       req.session.save((saveError) => {
-        if (saveError) {
-          console.error("Google session save error:", saveError);
+        if (saveError) return next(saveError);
 
-          return res.status(500).json({
-            error: "Failed to save Google login session",
-          });
-        }
-
-        return res.json({
+        res.json({
+          success: true,
           message: "Google login successful",
-          user: profile,
+          user: req.session.user,
         });
       });
     });
   } catch (error) {
-    console.error("Google authentication error:", error);
-
-    return res.status(401).json({
-      error: "Google authentication failed",
-    });
+    console.error("Google login error:", error);
+    next(error);
   }
 });
 
-// CURRENT USER
+// --------------------------------------------------
+// GET CURRENT USER
+// --------------------------------------------------
+
 app.get("/auth/me", (req, res) => {
-  return res.json({
-    authenticated: !!req.session.user,
-    user: req.session.user || null,
+  if (!req.session.user) {
+    return res.json({
+      authenticated: false,
+      user: null,
+    });
+  }
+
+  res.json({
+    authenticated: true,
+    user: req.session.user,
   });
 });
 
+// --------------------------------------------------
 // LOGOUT
-app.post("/auth/logout", (req, res) => {
+// --------------------------------------------------
+
+app.post("/auth/logout", (req, res, next) => {
   req.session.destroy((error) => {
-    if (error) {
-      return res.status(500).json({
-        error: "Logout failed",
-      });
-    }
+    if (error) return next(error);
 
     res.clearCookie("greenlife.sid", {
       httpOnly: true,
@@ -402,347 +390,276 @@ app.post("/auth/logout", (req, res) => {
       sameSite: isProduction ? "none" : "lax",
     });
 
-    return res.json({
+    res.json({
+      success: true,
       message: "Logged out successfully",
     });
   });
 });
 
-// ========================================
-// EVENT ROUTES
-// ========================================
+// --------------------------------------------------
+// GET ALL EVENTS
+// --------------------------------------------------
 
-// GET ALL EVENTS WITH ORGANIZER INFORMATION
-app.get("/events", async (req, res) => {
+app.get("/events", async (req, res, next) => {
   try {
-    const events = await getEventsCollection();
-    const users = await getUsersCollection();
+    const eventsCollection = await getEventsCollection();
+    const usersCollection = await getUsersCollection();
 
-    const result = await events
-      .find()
-      .sort({ dateTime: 1 })
+    const events = await eventsCollection
+      .find({})
+      .sort({ createdAt: -1 })
       .toArray();
 
     const organizerIds = [
       ...new Set(
-        result
+        events
           .map((event) => event.organizerId)
           .filter((id) => id && ObjectId.isValid(id))
       ),
     ];
 
-    const organizers = await users
-      .find({
-        _id: {
-          $in: organizerIds.map((id) => new ObjectId(id)),
-        },
-      })
-      .project({ name: 1, email: 1 })
-      .toArray();
+    const organizers = organizerIds.length
+      ? await usersCollection
+          .find({
+            _id: {
+              $in: organizerIds.map((id) => new ObjectId(id)),
+            },
+          })
+          .project({ password: 0 })
+          .toArray()
+      : [];
 
     const organizerMap = new Map(
-      organizers.map((organizer) => [
-        organizer._id.toString(),
-        {
-          name: organizer.name || "Unknown organizer",
-          email: organizer.email || "",
-        },
-      ])
+      organizers.map((user) => [user._id.toString(), user])
     );
 
-    const formattedEvents = result.map((event) => {
-      const { _id, ...rest } = event;
+    const formattedEvents = events.map((event) => ({
+      ...event,
+      _id: event._id.toString(),
+      organizer:
+        organizerMap.get(event.organizerId)?.name || "Unknown Organizer",
+    }));
 
-      return {
-        ...rest,
-        id: _id.toString(),
-        attendeeIds: event.attendeeIds ?? [],
-        organizer:
-          organizerMap.get(event.organizerId) ?? {
-            name: "Unknown organizer",
-            email: "",
-          },
-      };
-    });
-
-    return res.json({
+    res.json({
+      success: true,
       events: formattedEvents,
     });
   } catch (error) {
-    console.error("Get events error:", error);
-
-    return res.status(500).json({
-      error: "Failed to get events",
-    });
+    console.error("GET /events error:", error);
+    next(error);
   }
 });
 
-// CREATE EVENT
-app.post("/events", requireAuth, async (req, res) => {
-  try {
-    const {
-      title,
-      description,
-      location,
-      dateTime,
-      endDateTime,
-      category,
-      imageUrl,
-    } = req.body;
-
-    if (
-      !title?.trim() ||
-      !description?.trim() ||
-      !location?.trim() ||
-      !dateTime ||
-      !endDateTime ||
-      !category?.trim()
-    ) {
-      return res.status(400).json({
-        error: "Please provide all required event information",
-      });
-    }
-
-    const start = new Date(dateTime);
-    const end = new Date(endDateTime);
-
-    if (
-      Number.isNaN(start.getTime()) ||
-      Number.isNaN(end.getTime())
-    ) {
-      return res.status(400).json({
-        error: "Invalid event date or time",
-      });
-    }
-
-    if (end <= start) {
-      return res.status(400).json({
-        error: "Event end time must be after start time",
-      });
-    }
-
-    const events = await getEventsCollection();
-
-    const newEvent = {
-      title: title.trim(),
-      description: description.trim(),
-      location: location.trim(),
-      dateTime,
-      endDateTime,
-      category: category.trim(),
-      imageUrl: imageUrl || "",
-      organizerId: req.session.user.id,
-      attendeeIds: [],
-      createdAt: new Date().toISOString(),
-    };
-
-    const result = await events.insertOne(newEvent);
-
-    return res.status(201).json({
-      message: "Event created successfully",
-      event: {
-        ...newEvent,
-        id: result.insertedId.toString(),
-      },
-    });
-  } catch (error) {
-    console.error("Create event error:", error);
-
-    return res.status(500).json({
-      error: "Failed to create event",
-    });
-  }
-});
-
+// --------------------------------------------------
 // GET SINGLE EVENT
-app.get("/events/:id", async (req, res) => {
+// --------------------------------------------------
+
+app.get("/events/:id", async (req, res, next) => {
   try {
-    if (!ObjectId.isValid(req.params.id)) {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
       return res.status(400).json({
-        error: "Invalid event ID",
+        success: false,
+        message: "Invalid event ID",
       });
     }
 
     const events = await getEventsCollection();
 
     const event = await events.findOne({
-      _id: new ObjectId(req.params.id),
+      _id: new ObjectId(id),
     });
 
     if (!event) {
       return res.status(404).json({
-        error: "Event not found",
+        success: false,
+        message: "Event not found",
       });
     }
 
-    const { _id, ...rest } = event;
-
-    return res.json({
+    res.json({
+      success: true,
       event: {
-        ...rest,
-        id: _id.toString(),
-        attendeeIds: rest.attendeeIds ?? [],
+        ...event,
+        _id: event._id.toString(),
       },
     });
   } catch (error) {
-    console.error("Get event error:", error);
-
-    return res.status(500).json({
-      error: "Failed to get event",
-    });
+    next(error);
   }
 });
 
+// --------------------------------------------------
+// CREATE EVENT
+// --------------------------------------------------
+
+app.post("/events", requireAuth, async (req, res, next) => {
+  try {
+    const events = await getEventsCollection();
+
+    const eventData = {
+      ...req.body,
+      organizerId: req.session.user.id,
+      createdAt: new Date(),
+      participants: [],
+    };
+
+    const result = await events.insertOne(eventData);
+
+    res.status(201).json({
+      success: true,
+      message: "Event created successfully",
+      event: {
+        ...eventData,
+        _id: result.insertedId.toString(),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --------------------------------------------------
 // JOIN EVENT
-app.post("/events/:id/join", requireAuth, async (req, res) => {
+// --------------------------------------------------
+
+app.post("/events/:id/join", requireAuth, async (req, res, next) => {
   try {
-    if (!ObjectId.isValid(req.params.id)) {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
       return res.status(400).json({
-        error: "Invalid event ID",
+        success: false,
+        message: "Invalid event ID",
       });
     }
 
     const events = await getEventsCollection();
+    const userId = req.session.user.id;
 
     const result = await events.updateOne(
-      { _id: new ObjectId(req.params.id) },
-      {
-        $addToSet: {
-          attendeeIds: req.session.user.id,
-        },
-      }
+      { _id: new ObjectId(id) },
+      { $addToSet: { participants: userId } }
     );
 
-    if (result.matchedCount === 0) {
+    if (!result.matchedCount) {
       return res.status(404).json({
-        error: "Event not found",
+        success: false,
+        message: "Event not found",
       });
     }
 
-    const event = await events.findOne({
-      _id: new ObjectId(req.params.id),
-    });
-
-    return res.json({
-      message: "Successfully joined the event",
-      attendeeIds: event.attendeeIds ?? [],
+    res.json({
+      success: true,
+      message: "Joined event successfully",
     });
   } catch (error) {
-    console.error("Join event error:", error);
-
-    return res.status(500).json({
-      error: "Failed to join event",
-    });
+    next(error);
   }
 });
 
+// --------------------------------------------------
 // LEAVE EVENT
-app.delete("/events/:id/join", requireAuth, async (req, res) => {
+// --------------------------------------------------
+
+app.delete("/events/:id/join", requireAuth, async (req, res, next) => {
   try {
-    if (!ObjectId.isValid(req.params.id)) {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
       return res.status(400).json({
-        error: "Invalid event ID",
+        success: false,
+        message: "Invalid event ID",
       });
     }
 
     const events = await getEventsCollection();
 
     const result = await events.updateOne(
-      { _id: new ObjectId(req.params.id) },
-      {
-        $pull: {
-          attendeeIds: req.session.user.id,
-        },
-      }
+      { _id: new ObjectId(id) },
+      { $pull: { participants: req.session.user.id } }
     );
 
-    if (result.matchedCount === 0) {
+    if (!result.matchedCount) {
       return res.status(404).json({
-        error: "Event not found",
+        success: false,
+        message: "Event not found",
       });
     }
 
-    const event = await events.findOne({
-      _id: new ObjectId(req.params.id),
-    });
-
-    return res.json({
-      message: "Successfully left the event",
-      attendeeIds: event.attendeeIds ?? [],
+    res.json({
+      success: true,
+      message: "Left event successfully",
     });
   } catch (error) {
-    console.error("Leave event error:", error);
-
-    return res.status(500).json({
-      error: "Failed to leave event",
-    });
+    next(error);
   }
 });
 
-// DELETE EVENT - ORGANIZER ONLY
-app.delete("/events/:id", requireAuth, async (req, res) => {
+// --------------------------------------------------
+// DELETE EVENT
+// --------------------------------------------------
+
+app.delete("/events/:id", requireAuth, async (req, res, next) => {
   try {
-    if (!ObjectId.isValid(req.params.id)) {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
       return res.status(400).json({
-        error: "Invalid event ID",
+        success: false,
+        message: "Invalid event ID",
       });
     }
 
     const events = await getEventsCollection();
 
     const result = await events.deleteOne({
-      _id: new ObjectId(req.params.id),
+      _id: new ObjectId(id),
       organizerId: req.session.user.id,
     });
 
-    if (result.deletedCount === 0) {
+    if (!result.deletedCount) {
       return res.status(404).json({
-        error: "Event not found or you are not its organizer",
+        success: false,
+        message: "Event not found or you are not the organizer",
       });
     }
 
-    return res.json({
+    res.json({
+      success: true,
       message: "Event deleted successfully",
     });
   } catch (error) {
-    console.error("Delete event error:", error);
-
-    return res.status(500).json({
-      error: "Failed to delete event",
-    });
+    next(error);
   }
 });
 
-// UPDATE EVENT - ORGANIZER ONLY
-app.patch("/events/:id", requireAuth, async (req, res) => {
+// --------------------------------------------------
+// UPDATE EVENT
+// --------------------------------------------------
+
+app.patch("/events/:id", requireAuth, async (req, res, next) => {
   try {
-    if (!ObjectId.isValid(req.params.id)) {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
       return res.status(400).json({
-        error: "Invalid event ID",
-      });
-    }
-
-    const events = await getEventsCollection();
-
-    const existingEvent = await events.findOne({
-      _id: new ObjectId(req.params.id),
-      organizerId: req.session.user.id,
-    });
-
-    if (!existingEvent) {
-      return res.status(404).json({
-        error: "Event not found or you are not its organizer",
+        success: false,
+        message: "Invalid event ID",
       });
     }
 
     const allowedFields = [
       "title",
       "description",
+      "date",
+      "time",
       "location",
-      "dateTime",
-      "endDateTime",
       "category",
-      "imageUrl",
+      "image",
+      "capacity",
     ];
 
     const updates = {};
@@ -753,121 +670,62 @@ app.patch("/events/:id", requireAuth, async (req, res) => {
       }
     }
 
-    if (Object.keys(updates).length === 0) {
+    if (!Object.keys(updates).length) {
       return res.status(400).json({
-        error: "No valid fields provided",
+        success: false,
+        message: "No valid fields provided",
       });
     }
 
-    const startDateTime =
-      updates.dateTime ?? existingEvent.dateTime;
+    updates.updatedAt = new Date();
 
-    const endDateTime =
-      updates.endDateTime ?? existingEvent.endDateTime;
+    const events = await getEventsCollection();
 
-    if (!startDateTime || !endDateTime) {
-      return res.status(400).json({
-        error: "Both event start and end times are required",
-      });
-    }
-
-    const start = new Date(startDateTime);
-    const end = new Date(endDateTime);
-
-    if (
-      Number.isNaN(start.getTime()) ||
-      Number.isNaN(end.getTime())
-    ) {
-      return res.status(400).json({
-        error: "Invalid event date or time",
-      });
-    }
-
-    if (end <= start) {
-      return res.status(400).json({
-        error: "Event end time must be after start time",
-      });
-    }
-
-    const result = await events.findOneAndUpdate(
+    const result = await events.updateOne(
       {
-        _id: new ObjectId(req.params.id),
+        _id: new ObjectId(id),
         organizerId: req.session.user.id,
       },
-      {
-        $set: updates,
-      },
-      {
-        returnDocument: "after",
-      }
+      { $set: updates }
     );
 
-    if (!result) {
+    if (!result.matchedCount) {
       return res.status(404).json({
-        error: "Event not found or you are not its organizer",
+        success: false,
+        message: "Event not found or you are not the organizer",
       });
     }
 
-    const { _id, ...rest } = result;
-
-    return res.json({
+    res.json({
+      success: true,
       message: "Event updated successfully",
-      event: {
-        ...rest,
-        id: _id.toString(),
-        attendeeIds: rest.attendeeIds ?? [],
-      },
     });
   } catch (error) {
-    console.error("Update event error:", error);
-
-    return res.status(500).json({
-      error: "Failed to update event",
-    });
+    next(error);
   }
 });
 
-// ========================================
-// HOME AND HEALTH ROUTES
-// ========================================
-
-app.get("/", (req, res) => {
-  res.json({
-    message: "GreenLife server is running",
-  });
-});
-
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    status: "OK",
-    message: "GreenLife API is running",
-  });
-});
-
-// ========================================
-// ERROR HANDLER
-// ========================================
+// --------------------------------------------------
+// GLOBAL ERROR HANDLER
+// --------------------------------------------------
 
 app.use((error, req, res, next) => {
-  console.error("Unhandled server error:", error);
+  console.error("Server error:", error);
 
   if (res.headersSent) {
     return next(error);
   }
 
-  return res.status(500).json({
-    error: "Internal server error",
+  res.status(500).json({
+    success: false,
+    message: "Internal server error",
+    error: isProduction ? undefined : error.message,
   });
 });
 
-// ========================================
-// VERCEL EXPORT
-// ========================================
-
-// Do not use app.listen() when deploying this Express app
-// as a Vercel serverless application.
-
-const PORT = Number(process.env.PORT) || 5001;
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
 
 if (!process.env.VERCEL) {
   app.listen(PORT, "0.0.0.0", () => {
