@@ -353,9 +353,9 @@ app.post("/auth/logout", (req, res) => {
   });
 });
 
-// ========================================
+
 // EVENT ROUTES
-// ========================================
+
 
 // GET ALL EVENTS
 
@@ -425,7 +425,7 @@ app.get("/events", async (req, res) => {
   }
 });
 
-// ========================================
+
 // CREATE EVENT
 // ========================================
 
@@ -506,7 +506,7 @@ app.post("/events", requireAuth, async (req, res) => {
   }
 });
 
-// ========================================
+
 // GET ALL EVENTS
 // ========================================
 
@@ -537,7 +537,7 @@ app.get("/events", async (req, res) => {
   }
 });
 
-// ========================================
+
 // GET SINGLE EVENT
 // ========================================
 
@@ -579,9 +579,9 @@ app.get("/events/:id", async (req, res) => {
   }
 });
 
-// ========================================
+
 // JOIN EVENT
-// ========================================
+// =================================
 
 app.post("/events/:id/join", requireAuth, async (req, res) => {
   try {
@@ -617,9 +617,10 @@ app.post("/events/:id/join", requireAuth, async (req, res) => {
     return res.status(500).json({ error: "Failed to join event" });
   }
 });
-// ========================================
+
+
 // LEAVE EVENT
-// ========================================
+// ==================================
 
 app.delete("/events/:id/join", requireAuth, async (req, res) => {
   try {
@@ -658,7 +659,7 @@ app.delete("/events/:id/join", requireAuth, async (req, res) => {
 
 
 
-// ========================================
+
 // DELETE EVENT (ONLY ORGANIZER)
 // ========================================
 
@@ -695,7 +696,7 @@ app.delete("/events/:id", requireAuth, async (req, res) => {
   }
 });
 
-// ========================================
+
 // UPDATE EVENT (ONLY ORGANIZER)
 // ========================================
 
@@ -810,7 +811,7 @@ app.patch("/events/:id", requireAuth, async (req, res) => {
   }
 });
 
-// ========================================
+
 // HOME ROUTE
 // ========================================
 
