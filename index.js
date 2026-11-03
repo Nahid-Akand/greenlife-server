@@ -733,7 +733,7 @@ app.use((error, req, res, next) => {
 // START SERVER
 // --------------------------------------------------
 
-if (!process.env.VERCEL) {
+if (!process.env.NETLIFY) {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`GreenLife server running on port ${PORT}`);
   });
