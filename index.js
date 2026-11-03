@@ -2,7 +2,7 @@
 import express from "express";
 import cors from "cors";
 import session from "express-session";
-import MongoStore from "connect-mongo";
+import { MongoStore } from "connect-mongo";
 import bcrypt from "bcryptjs";
 import { MongoClient, ObjectId } from "mongodb";
 import { OAuth2Client } from "google-auth-library";
