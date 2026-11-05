@@ -1,3 +1,4 @@
+
 import express from "express";
 import cors from "cors";
 import session from "express-session";
@@ -103,66 +104,6 @@ app.use(
 
 
 
-
-
-//------------------------
-//check if the server is running in production mode
-//------------------------
-app.get("/test-session", async (req, res) => {
-  try {
-    console.log("Session test started");
-    console.log("Session ID:", req.sessionID);
-    console.log("Session available:", Boolean(req.session));
-
-    req.session.testValue = "GreenLife session works";
-
-    await new Promise((resolve, reject) => {
-      req.session.save((error) => {
-        if (error) reject(error);
-        else resolve();
-      });
-    });
-
-    res.json({
-      success: true,
-      sessionID: req.sessionID,
-      message: "Session saved successfully",
-    });
-  } catch (error) {
-    console.error("SESSION TEST ERROR:", error);
-
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
-  }
-});
-app.get("/check-session", (req, res) => {
-  res.json({
-    success: true,
-    sessionID: req.sessionID,
-    testValue: req.session?.testValue || null,
-    sessionWorks: req.session?.testValue === "GreenLife session works",
-  });
-});app.get("/test-session-now", (req, res) => {
-  req.session.testValue = "GreenLife session works";
-
-  req.session.save((error) => {
-    if (error) {
-      return res.status(500).json({
-        success: false,
-        error: error.message,
-      });
-    }
-
-    res.json({
-      success: true,
-      sessionID: req.sessionID,
-      testValue: req.session.testValue,
-      sessionWorks: true,
-    });
-  });
-});
 
 // --------------------------------------------------
 // MONGODB CONNECTION
