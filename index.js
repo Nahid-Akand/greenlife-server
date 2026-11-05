@@ -14,10 +14,12 @@ import "dotenv/config";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 5001;
-const isProduction = process.env.NODE_ENV === "production";
+
 
 console.log("NODE_ENV:", process.env.NODE_ENV);
-console.log("isProduction:", isProduction);
+const isProduction =
+  process.env.VERCEL === "1" ||
+  process.env.NODE_ENV === "production";
 
 const googleClient = new OAuth2Client(
   process.env.GOOGLE_CLIENT_ID
